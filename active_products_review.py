@@ -11,16 +11,16 @@ st.set_page_config(page_title="Catalog Integrity Check", layout="wide")
 st.title("🛒 Catalog Integrity Checker")
 st.markdown("""
 **Operational Guardrail:** Upload the latest active exports from Shopify and Dynamics 365. 
-This tool cross-references inventory and lifecycle statuses to generate an instant bulk-import fix file, preventing phantom inventory and overselling.
+Map your columns dynamically below to generate an instant bulk-import fix file, preventing phantom inventory and overselling.
 """)
 
 st.divider()
 
 # ==========================================
-# SIDEBAR CONFIGURATION
+# SIDEBAR CONFIGURATION (BUSINESS RULES)
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("⚙️ Business Rules")
     inventory_buffer = st.number_input(
         "Inventory Buffer Threshold", 
         min_value=0, value=1, 
@@ -33,7 +33,7 @@ with st.sidebar:
     )
 
 # ==========================================
-# FILE UPLOADERS
+# 1. FILE UPLOADERS
 # ==========================================
 col1, col2 = st.columns(2)
 
@@ -46,7 +46,7 @@ with col2:
     d365_file = st.file_uploader("Upload d365_export.csv", type=['csv'])
 
 # ==========================================
-# EXECUTION LOGIC
+# 2. DYNAMIC COLUMN MAPPING & EXECUTION
 # ==========================================
 if shopify_file is not None and d365_file is not None:
     
@@ -58,37 +58,58 @@ if shopify_file is not None and d365_file is not None:
         st.error(f"Error reading files: {e}")
         st.stop()
 
-    # Verify required columns exist (using the dummy names from our previous test)
-    req_shopify_cols = ['Handle', 'SKU', 'Status']
-    req_d365_cols = ['SKU', 'Available_Quantity', 'Item_Status']
-    
-    missing_shopify = [col for col in req_shopify_cols if col not in df_shopify.columns]
-    missing_d365 = [col for col in req_d365_cols if col not in df_d365.columns]
-    
-    if missing_shopify or missing_d365:
-        st.error("⚠️ Column Mismatch Detected!")
-        if missing_shopify:
-            st.write(f"Missing in Shopify export: {missing_shopify}")
-        if missing_d365:
-            st.write(f"Missing in D365 export: {missing_d365}")
-        st.info("Please ensure your CSVs match the required formatting.")
-        st.stop()
+    st.divider()
+    st.subheader("3. Map Data Columns")
+    st.markdown("The system has tried to auto-detect the correct columns. Please verify before running.")
 
+    # Helper function to auto-guess the right column dropdown index
+    def get_default_index(columns_list, guess_words):
+        for i, col in enumerate(columns_list):
+            if any(guess.lower() in str(col).lower() for guess in guess_words):
+                return i
+        return 0
+
+    map_col1, map_col2 = st.columns(2)
+
+    with map_col1:
+        st.markdown("**🛍️ Shopify Data**")
+        shop_cols = list(df_shopify.columns)
+        shop_handle_col = st.selectbox("Which column is the Handle?", shop_cols, index=get_default_index(shop_cols, ['handle']))
+        shop_sku_col = st.selectbox("Which column is the SKU?", shop_cols, index=get_default_index(shop_cols, ['sku']))
+        shop_status_col = st.selectbox("Which column is the Status?", shop_cols, index=get_default_index(shop_cols, ['status', 'state', 'active']))
+
+    with map_col2:
+        st.markdown("**🏢 D365 Data**")
+        d365_cols = list(df_d365.columns)
+        d365_sku_col = st.selectbox("Which column is the D365 SKU?", d365_cols, index=get_default_index(d365_cols, ['sku', 'item', 'number']))
+        d365_qty_col = st.selectbox("Which column is Available Quantity?", d365_cols, index=get_default_index(d365_cols, ['qty', 'quantity', 'stock', 'available']))
+        d365_status_col = st.selectbox("Which column is Item Status?", d365_cols, index=get_default_index(d365_cols, ['status', 'lifecycle', 'state']))
+
+    # ==========================================
+    # 3. LOGIC ENGINE
+    # ==========================================
+    st.write("") # Spacer
     if st.button("🚀 Run Integrity Check", use_container_width=True, type="primary"):
-        with st.spinner("Crunching data..."):
+        with st.spinner("Cross-referencing catalogs..."):
             
-            # Merge on SKU
-            df_merged = pd.merge(df_shopify, df_d365, on='SKU', how='inner')
+            # Merge dynamically based on user selections
+            df_merged = pd.merge(
+                df_shopify, 
+                df_d365, 
+                left_on=shop_sku_col, 
+                right_on=d365_sku_col, 
+                how='inner'
+            )
             
-            # Logic Engine
+            # Logic Engine using dynamic columns
             def determine_new_status(row):
-                if str(row['Status']).strip().lower() == 'active':
+                if str(row[shop_status_col]).strip().lower() == 'active':
                     # Rule 1: Discontinued
-                    if str(row['Item_Status']).strip().lower() == discontinued_keyword.lower():
+                    if str(row[d365_status_col]).strip().lower() == discontinued_keyword.lower():
                         return 'Archived'
                     # Rule 2: Stock Risk
                     try:
-                        if float(row['Available_Quantity']) <= inventory_buffer:
+                        if float(row[d365_qty_col]) <= inventory_buffer:
                             return 'Draft'
                     except ValueError:
                         pass
@@ -109,13 +130,15 @@ if shopify_file is not None and d365_file is not None:
             total_drafted = len(df_action_needed[df_action_needed['New_Status'] == 'Draft'])
             total_archived = len(df_action_needed[df_action_needed['New_Status'] == 'Archived'])
             
-            metric_col1.metric("Total SKUs Evaluated", total_evaluated)
+            metric_col1.metric("Total SKUs Cross-Referenced", total_evaluated)
             metric_col2.metric("Drafted (Stock Risk)", total_drafted, delta="-Overselling Prevented", delta_color="normal")
             metric_col3.metric("Archived (Discontinued)", total_archived, delta="-Cleaned Catalog", delta_color="normal")
             
-            # Generate the Fix File
-            df_final = df_action_needed[['Handle', 'New_Status']].copy()
-            df_final.rename(columns={'New_Status': 'Status'}, inplace=True)
+            # Generate the Fix File using dynamic handle column
+            df_final = df_action_needed[[shop_handle_col, 'New_Status']].copy()
+            
+            # Shopify strictly requires the header to be "Handle" and "Status" for imports
+            df_final.rename(columns={shop_handle_col: 'Handle', 'New_Status': 'Status'}, inplace=True)
             
             if len(df_final) > 0:
                 st.success(f"**{len(df_final)} Anomalies Detected.** The fix file is ready for Shopify import.")
@@ -140,6 +163,8 @@ if shopify_file is not None and d365_file is not None:
                     )
                 with preview_col:
                     with st.expander("Preview Actionable Items"):
-                        st.dataframe(df_action_needed[['SKU', 'Handle', 'Available_Quantity', 'Item_Status', 'New_Status']], use_container_width=True)
+                        # Show the user a preview using the columns they selected
+                        preview_cols = [shop_sku_col, shop_handle_col, d365_qty_col, d365_status_col, 'New_Status']
+                        st.dataframe(df_action_needed[preview_cols], use_container_width=True)
             else:
                 st.success("✅ No anomalies found. The catalog is perfectly synced with D365.")
